@@ -77,6 +77,8 @@ type GoloccOutput struct {
 
 func main() {
 	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
+	color.NoColor = false
 
 	args := os.Args[1:]
 	if len(args) < 1 {
@@ -87,7 +89,7 @@ func main() {
 
 	infos := make(map[string]*PkgInfo)
 	rootInfo := &PkgInfo{
-		ImportPath: pkg,
+		ImportPath: "<root>",
 	}
 	for _, info := range getInfos(pkg) {
 		rootInfo.Imports = append(rootInfo.Imports, info.ImportPath)
@@ -127,12 +129,9 @@ func main() {
 			if !walked {
 				depInfo = getInfo(dep)
 				infos[dep] = depInfo
-			}
-
-			info.PkgDeps = append(info.PkgDeps, depInfo)
-			if !depInfo.Goroot {
 				walk(depInfo)
 			}
+			info.PkgDeps = append(info.PkgDeps, depInfo)
 		}
 	}
 
@@ -207,7 +206,7 @@ wait:
 	}
 
 	var tree gotree.Tree
-	if len(rootInfo.Imports) == 1 {
+	if len(rootInfo.PkgDeps) == 1 {
 		tree = mktree(rootInfo.PkgDeps[0])
 	} else {
 		tree = mktree(rootInfo)
