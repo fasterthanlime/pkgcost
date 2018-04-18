@@ -1,5 +1,7 @@
 # pkgcost
 
+![](https://img.shields.io/badge/weekend%20hack-heck%20yes!-green.svg?longCache=true&style=flat)
+
 pkgcost:
 
   * Requires <https://github.com/warmans/golocc> and a go toolchains in your `$PATH`
