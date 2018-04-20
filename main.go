@@ -177,9 +177,21 @@ func main() {
 			write(`%+v`, err)
 			write(`</pre>`)
 		} else if rootInfo != nil {
-			var walk func(id string, info *PkgInfo)
-			walk = func(id string, info *PkgInfo) {
-				log.Printf("walking %s", id)
+			type VisitMap map[string]bool
+			withPath := func(vm VisitMap, importPath string) (VisitMap, bool) {
+				if vm[importPath] {
+					return nil, false
+				}
+				vm2 := make(VisitMap)
+				for k, v := range vm {
+					vm2[k] = v
+				}
+				vm2[importPath] = true
+				return vm2, true
+			}
+
+			var walk func(vm VisitMap, id string, info *PkgInfo)
+			walk = func(vm VisitMap, id string, info *PkgInfo) {
 				write(`<li>`)
 				write(`<div class="package">`)
 
@@ -189,10 +201,9 @@ func main() {
 
 				ip := info.ImportPath
 				vendored := false
-				vendorTokens := strings.SplitN(ip, "/vendor/", 2)
-				if len(vendorTokens) == 2 {
+				if strings.Contains(info.Dir, "/vendor/") {
 					vendored = true
-					ip = vendorTokens[1]
+					hasDeps = false
 				}
 
 				pathTokens := strings.Split(ip, "/")
@@ -270,9 +281,11 @@ func main() {
 				if hasDeps {
 					write(`<div class="collapsible">`)
 					for _, importedInfo := range info.ImportedPkgs {
-						write(`<ul>`)
-						walk(id+"_"+importedInfo.ImportPath, importedInfo)
-						write(`</ul>`)
+						if vm2, ok := withPath(vm, importedInfo.ImportPath); ok {
+							write(`<ul>`)
+							walk(vm2, id+"_"+importedInfo.ImportPath, importedInfo)
+							write(`</ul>`)
+						}
 					}
 					write(`</div>`)
 				}
@@ -281,7 +294,7 @@ func main() {
 			}
 
 			write(`<ul>`)
-			walk(rootInfo.ImportPath, rootInfo)
+			walk(make(VisitMap), rootInfo.ImportPath, rootInfo)
 			write(`</ul>`)
 		}
 		write(`
