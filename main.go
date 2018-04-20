@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -98,7 +99,16 @@ func main() {
 
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
-		panic("empty $GOROOT!")
+		if runtime.GOOS == "windows" {
+			goroot = `C:\Go`
+		} else {
+			goroot = "/usr/local"
+		}
+
+		_, err := os.Stat(goroot)
+		if err != nil {
+			log.Fatalf("(%s) does not exist, please set $GOROOT", goroot)
+		}
 	}
 
 	rootcache := make(map[string]bool)
