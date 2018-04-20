@@ -1,283 +1,135 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
+	"html"
 	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strconv"
+	"net/http"
 	"strings"
-	"time"
 
-	"github.com/kisielk/gotool"
-
-	"github.com/disiqueira/gotree"
 	humanize "github.com/dustin/go-humanize"
-	"github.com/fatih/color"
 )
 
-type PkgInfo struct {
-	Goroot     bool
-	Dir        string
-	ImportPath string
-	Name       string
-	Imports    []string
-
-	GoFiles  []string
-	CgoFiles []string
-
-	PkgDeps []*PkgInfo
-	Stats   struct {
-		Files      int64
-		Size       int64
-		Complexity int64
-	}
-}
-
-func (info *PkgInfo) Walk(f func(info *PkgInfo)) {
-	walked := make(map[string]bool)
-	var walk func(info *PkgInfo)
-	walk = func(info *PkgInfo) {
-		if walked[info.ImportPath] {
-			return
-		}
-		walked[info.ImportPath] = true
-
-		if info.Goroot {
-			return
-		}
-
-		f(info)
-		for _, depInfo := range info.PkgDeps {
-			walk(depInfo)
-		}
-	}
-	walk(info)
-}
-
-func (info *PkgInfo) CountFiles() int64 {
-	var total int64
-	info.Walk(func(info *PkgInfo) {
-		total += info.Stats.Files
-	})
-	return total
-}
-
-func (info *PkgInfo) CountSize() int64 {
-	var total int64
-	info.Walk(func(info *PkgInfo) {
-		total += info.Stats.Size
-	})
-	return total
-}
-
-func (info *PkgInfo) CountComplexity() int64 {
-	var total int64
-	info.Walk(func(info *PkgInfo) {
-		total += info.Stats.Complexity
-	})
-	return total
-}
-
 func main() {
-	log.SetFlags(0)
-	color.NoColor = false
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		tokens := strings.SplitN(r.URL.Path, "/", 2)
+		pkg := tokens[1]
 
-	flag.Parse()
-	args := flag.Args()
-	if len(args) < 1 {
-		log.Fatal("usage: pkgcost PACKAGE")
-	}
+		var rootInfo *PkgInfo
+		var err error
+		if pkg != "" {
+			rootInfo, err = process([]string{pkg})
+		}
 
-	infos := make(map[string]*PkgInfo)
-	rootInfo := &PkgInfo{
-		ImportPath: "<root>",
-	}
+		write := func(f string, args ...interface{}) {
+			fmt.Fprintf(w, f, args...)
+		}
 
-	for _, importPath := range gotool.ImportPaths(args) {
-		cmd := exec.Command("go", "get", "-v", "-d", importPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Run()
+		write(`%s`, `
+<html>
+	<head>
+		<title>pkgcost</title>
+		<link href="https://fonts.googleapis.com/css?family=Lato" rel="stylesheet">
+		<style>
+		* {
+			font-family: 'Lato', sans-serif;
+			line-height: 1.6;
+		}
+
+		.package {
+			margin: 8px 4px;
+		}
+
+		.import-path {}
+
+		.tag {
+			padding: 3px;
+			margin: 0 4px;
+			border-radius: 4px;
+			font-size: 85%;
+			color: white;
+			background: grey;
+		}
+
+		.vendored {
+			background: yellow;
+		}
+
+		.size {
+			background: red;
+		}
+
+		.complexity {
+			background: blue;
+		}
+
+		ul {
+			list-style-type: none;
+			padding: 0 2em;
+		}
+
+		ul li {
+			margin: 0;
+			padding: 0;
+		}
+		</style>
+	</head>
+	<body>
+		<form>
+			<input name="pkg" type="text" placeholder="github.com/example/package"/>
+			<input type="submit" value="Explore!"/>
+		</form>
+		`)
 		if err != nil {
-			log.Fatalf("while fetching dependencies: %+v", err)
-		}
+			write(`<h3>Error: </h3>`)
+			write(`<pre>`)
+			write(`%+v`, err)
+			write(`</pre>`)
+		} else if rootInfo != nil {
+			var walk func(info *PkgInfo)
+			visited := make(map[string]bool)
+			walk = func(info *PkgInfo) {
+				write(`<li>`)
+				write(`<div class="package">`)
 
-		log.Printf("Entry point: %s", importPath)
-		pkgInfo := getInfo(importPath)
-		rootInfo.Imports = append(rootInfo.Imports, pkgInfo.ImportPath)
-	}
-
-	infos[rootInfo.ImportPath] = rootInfo
-
-	goroot := os.Getenv("GOROOT")
-	if goroot == "" {
-		if runtime.GOOS == "windows" {
-			goroot = `C:\Go`
-		} else {
-			goroot = "/usr/local/go"
-		}
-
-		_, err := os.Stat(goroot)
-		if err != nil {
-			log.Fatalf("(%s) does not exist, please set $GOROOT", goroot)
-		}
-	}
-
-	rootcache := make(map[string]bool)
-
-	isRoot := func(dep string) bool {
-		if v, ok := rootcache[dep]; ok {
-			return v
-		}
-
-		rootFolder := filepath.Join(goroot, "src", filepath.FromSlash(dep))
-		_, err := os.Stat(rootFolder)
-		rootcache[dep] = (err == nil)
-		return rootcache[dep]
-	}
-
-	var walk func(info *PkgInfo)
-	walk = func(info *PkgInfo) {
-		for _, dep := range info.Imports {
-			if isRoot(dep) {
-				continue
-			}
-
-			if dep == "C" {
-				continue
-			}
-
-			depInfo, walked := infos[dep]
-			if !walked {
-				depInfo = getInfo(dep)
-				infos[dep] = depInfo
-				walk(depInfo)
-			}
-			info.PkgDeps = append(info.PkgDeps, depInfo)
-		}
-	}
-
-	done := make(chan bool)
-	go func() {
-		walk(rootInfo)
-		done <- true
-	}()
-
-	<-done
-	fmt.Printf("\n")
-
-	for _, info := range infos {
-		if info.Goroot {
-			continue
-		}
-
-		info.Stats.Files = int64(len(info.GoFiles) + len(info.CgoFiles))
-
-		if info.Dir != "" {
-			processFile := func(f string) {
-				fpath := filepath.Join(info.Dir, f)
-				stat, err := os.Stat(fpath)
-				if err != nil {
-					log.Fatalf("while getting file size: %+v", err)
+				ip := info.ImportPath
+				vendored := false
+				vendorTokens := strings.SplitN(ip, "/vendor/", 2)
+				if len(vendorTokens) == 2 {
+					vendored = true
+					ip = vendorTokens[1]
 				}
-				info.Stats.Size += stat.Size()
+				ip = strings.Replace(ip, "github.com/", "@", 1)
 
-				cOutput, err := exec.Command("gocyclo", fpath).Output()
-				if err != nil {
-					log.Fatalf("while running gocyclo: %+v", err)
+				write(`<span class="import-path">%s</span>`, html.EscapeString(ip))
+				write(` <span class="tag size">%s</span>`, humanize.IBytes(uint64(info.CountSize())))
+				write(` <span class="tag complexity">%d</span>`, info.CountComplexity())
+				if vendored {
+					write(` <span class="tag vendor"/>`, info.CountComplexity())
 				}
-				s := bufio.NewScanner(bytes.NewReader(cOutput))
-				for s.Scan() {
-					line := s.Text()
-					firstToken := strings.Split(line, " ")[0]
-					complex, err := strconv.ParseInt(firstToken, 10, 64)
-					if err != nil {
-						log.Fatalf("while parsing gocyclo output: %+v", err)
+				write(`</div>`)
+				for _, depInfo := range info.PkgDeps {
+					if visited[depInfo.ImportPath] {
+						return
 					}
-					info.Stats.Complexity += complex
+					visited[depInfo.ImportPath] = true
+					write(`<ul>`)
+					walk(depInfo)
+					write(`</ul>`)
 				}
+				write(`</li>`)
 			}
-			for _, f := range info.GoFiles {
-				processFile(f)
-			}
-			for _, f := range info.CgoFiles {
-				processFile(f)
-			}
+
+			write(`<ul>`)
+			walk(rootInfo)
+			write(`</ul>`)
 		}
-	}
-
-	yellow := color.New(color.FgYellow).SprintFunc()
-	green := color.New(color.FgGreen).SprintfFunc()
-	blue := color.New(color.FgBlue).SprintFunc()
-
-	var mktree func(info *PkgInfo) gotree.Tree
-	mktree = func(info *PkgInfo) gotree.Tree {
-		ip := info.ImportPath
-		ip = strings.Replace(ip, "github.com/", "@", 1)
-		tree := gotree.New(fmt.Sprintf("%s (%s) [%s]",
-			yellow(fmt.Sprintf("%d", info.CountComplexity())),
-			green(humanize.IBytes(uint64(info.CountSize()))),
-			blue(ip),
-		))
-
-		if !strings.Contains(info.ImportPath, "/vendor") {
-			for _, depInfo := range info.PkgDeps {
-				depTree := mktree(depInfo)
-				tree.AddTree(depTree)
-			}
-		} else {
-			tree.Add("(...ignoring deps of vendored package)")
-		}
-		return tree
-	}
-
-	var tree gotree.Tree
-	if len(rootInfo.PkgDeps) == 1 {
-		tree = mktree(rootInfo.PkgDeps[0])
-	} else {
-		tree = mktree(rootInfo)
-	}
-	fmt.Print(tree.Print())
-}
-
-func getInfos(importPath string) []*PkgInfo {
-	before := time.Now()
-	payload, err := exec.Command("go", "list", "-json", importPath).Output()
-	log.Printf("%s: %s", importPath, time.Since(before))
-	if err != nil {
-		log.Printf("While walking %s", importPath)
-		panic(err)
-	}
-
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	var infos []*PkgInfo
-	for {
-		info := &PkgInfo{}
-		err = dec.Decode(info)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			panic(err)
-		}
-		infos = append(infos, info)
-	}
-
-	return infos
-}
-
-func getInfo(importPath string) *PkgInfo {
-	infos := getInfos(importPath)
-	if len(infos) != 1 {
-		panic("expected 1 info")
-	}
-	return infos[0]
+		write(`
+	</body>
+</html>
+			`)
+	})
+	addr := "localhost:9089"
+	log.Printf("Listening on %s", addr)
+	http.ListenAndServe(addr, http.DefaultServeMux)
 }
