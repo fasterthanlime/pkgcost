@@ -10,8 +10,8 @@ type PkgInfo struct {
 	GoFiles  []string
 	CgoFiles []string
 
-	PkgDeps []*PkgInfo
-	Stats   struct {
+	ImportedPkgs []*PkgInfo
+	Stats        struct {
 		Files      int64
 		Size       int64
 		Complexity int64
@@ -32,8 +32,8 @@ func (info *PkgInfo) Walk(f func(info *PkgInfo)) {
 		}
 
 		f(info)
-		for _, depInfo := range info.PkgDeps {
-			walk(depInfo)
+		for _, importedInfo := range info.ImportedPkgs {
+			walk(importedInfo)
 		}
 	}
 	walk(info)

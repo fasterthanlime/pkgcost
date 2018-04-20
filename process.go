@@ -1,19 +1,15 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
+	"go/parser"
+	"go/token"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"sort"
 	"strings"
-	"time"
 
 	"github.com/kisielk/gotool"
 	"github.com/pkg/errors"
@@ -22,7 +18,7 @@ import (
 func process(args []string) (*PkgInfo, error) {
 	infos := make(map[string]*PkgInfo)
 	rootInfo := &PkgInfo{
-		ImportPath: "<root>",
+		ImportPath: fmt.Sprintf("glob %s", strings.Join(args, " ")),
 	}
 
 	for _, importPath := range gotool.ImportPaths(args) {
@@ -76,17 +72,17 @@ func process(args []string) (*PkgInfo, error) {
 				continue
 			}
 
-			depInfo, walked := infos[dep]
+			importedInfo, walked := infos[dep]
 			if !walked {
 				var err error
-				depInfo, err = getInfo(dep)
+				importedInfo, err = getInfo(dep)
 				if err != nil {
 					return errors.WithStack(err)
 				}
-				infos[dep] = depInfo
-				walk(depInfo)
+				infos[dep] = importedInfo
+				walk(importedInfo)
 			}
-			info.PkgDeps = append(info.PkgDeps, depInfo)
+			info.ImportedPkgs = append(info.ImportedPkgs, importedInfo)
 		}
 		return nil
 	}
@@ -101,31 +97,30 @@ func process(args []string) (*PkgInfo, error) {
 			continue
 		}
 
-		info.Stats.Files = int64(len(info.GoFiles) + len(info.CgoFiles))
+		info.Stats.Files = int64(len(info.GoFiles))
 
 		if info.Dir != "" {
-			processFile := func(f string) error {
-				fpath := filepath.Join(info.Dir, f)
+			processFile := func(fpath string) error {
 				stat, err := os.Stat(fpath)
 				if err != nil {
 					return errors.WithMessage(err, "while getting file size")
 				}
 				info.Stats.Size += stat.Size()
 
-				cOutput, err := exec.Command("gocyclo", fpath).Output()
-				if err != nil {
-					return errors.WithMessage(err, "while running gocyclo")
-				}
-				s := bufio.NewScanner(bytes.NewReader(cOutput))
-				for s.Scan() {
-					line := s.Text()
-					firstToken := strings.Split(line, " ")[0]
-					complex, err := strconv.ParseInt(firstToken, 10, 64)
-					if err != nil {
-						return errors.WithMessage(err, "while parsing gocyclo output")
-					}
-					info.Stats.Complexity += complex
-				}
+				// cOutput, err := exec.Command("gocyclo", fpath).Output()
+				// if err != nil {
+				// 	return errors.WithMessage(err, "while running gocyclo")
+				// }
+				// s := bufio.NewScanner(bytes.NewReader(cOutput))
+				// for s.Scan() {
+				// 	line := s.Text()
+				// 	firstToken := strings.Split(line, " ")[0]
+				// 	complex, err := strconv.ParseInt(firstToken, 10, 64)
+				// 	if err != nil {
+				// 		return errors.WithMessage(err, "while parsing gocyclo output")
+				// 	}
+				// 	info.Stats.Complexity += complex
+				// }
 				return nil
 			}
 			for _, f := range info.GoFiles {
@@ -134,49 +129,60 @@ func process(args []string) (*PkgInfo, error) {
 					return nil, err
 				}
 			}
-			for _, f := range info.CgoFiles {
-				err := processFile(f)
-				if err != nil {
-					return nil, err
-				}
-			}
 		}
 	}
+
+	if len(rootInfo.ImportedPkgs) == 1 {
+		return rootInfo.ImportedPkgs[0], nil
+	}
+
+	rootInfo.ImportPath = strings.TrimPrefix(rootInfo.ImportPath, "glob ")
 	return rootInfo, nil
 }
 
-func getInfos(importPath string) ([]*PkgInfo, error) {
-	before := time.Now()
-	payload, err := exec.Command("go", "list", "-json", importPath).CombinedOutput()
-	log.Printf("%s: %s", importPath, time.Since(before))
-	if err != nil {
-		return nil, errors.WithMessage(err, fmt.Sprintf("while walking %s - output: %s", importPath, string(payload)))
+func filter(fi os.FileInfo) bool {
+	if strings.HasSuffix(strings.ToLower(fi.Name()), "_test.go") {
+		return false
 	}
-
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	var infos []*PkgInfo
-	for {
-		info := &PkgInfo{}
-		err = dec.Decode(info)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			panic(err)
-		}
-		infos = append(infos, info)
-	}
-
-	return infos, nil
+	return true
 }
 
 func getInfo(importPath string) (*PkgInfo, error) {
-	infos, err := getInfos(importPath)
+	fset := token.NewFileSet()
+
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		return nil, errors.Errorf("$GOPATH is not set")
+	}
+
+	dir := filepath.Join(gopath, "src", filepath.FromSlash(importPath))
+	d, err := parser.ParseDir(fset, dir, filter, parser.ImportsOnly)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "while parsing files")
 	}
-	if len(infos) != 1 {
-		return nil, errors.Errorf("expected 1 info")
+
+	info := &PkgInfo{
+		Dir:        dir,
+		ImportPath: importPath,
 	}
-	return infos[0], nil
+
+	importMap := make(map[string]bool)
+	for _, pkg := range d {
+		for name, f := range pkg.Files {
+			info.GoFiles = append(info.GoFiles, name)
+
+			for _, imp := range f.Imports {
+				ip := imp.Path.Value
+				ip = ip[1 : len(ip)-1]
+				importMap[ip] = true
+			}
+		}
+	}
+
+	for imp := range importMap {
+		info.Imports = append(info.Imports, imp)
+	}
+	sort.Strings(info.Imports)
+
+	return info, nil
 }
