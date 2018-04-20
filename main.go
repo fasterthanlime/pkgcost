@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -10,8 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kisielk/gotool"
 
 	"github.com/disiqueira/gotree"
 	humanize "github.com/dustin/go-humanize"
@@ -30,8 +35,9 @@ type PkgInfo struct {
 
 	PkgDeps []*PkgInfo
 	Stats   struct {
-		Files int64
-		Lines int64
+		Files      int64
+		Size       int64
+		Complexity int64
 	}
 }
 
@@ -64,37 +70,51 @@ func (info *PkgInfo) CountFiles() int64 {
 	return total
 }
 
-func (info *PkgInfo) CountLines() int64 {
+func (info *PkgInfo) CountSize() int64 {
 	var total int64
 	info.Walk(func(info *PkgInfo) {
-		total += info.Stats.Lines
+		total += info.Stats.Size
 	})
 	return total
 }
 
-type GoloccOutput struct {
-	NCLOC int64
+func (info *PkgInfo) CountComplexity() int64 {
+	var total int64
+	info.Walk(func(info *PkgInfo) {
+		total += info.Stats.Complexity
+	})
+	return total
 }
 
 func main() {
 	log.SetFlags(0)
-	log.SetOutput(os.Stdout)
 	color.NoColor = false
 
-	args := os.Args[1:]
+	flag.Parse()
+	args := flag.Args()
 	if len(args) < 1 {
 		log.Fatal("usage: pkgcost PACKAGE")
 	}
-
-	pkg := args[0]
 
 	infos := make(map[string]*PkgInfo)
 	rootInfo := &PkgInfo{
 		ImportPath: "<root>",
 	}
-	for _, info := range getInfos(pkg) {
-		rootInfo.Imports = append(rootInfo.Imports, info.ImportPath)
+
+	for _, importPath := range gotool.ImportPaths(args) {
+		cmd := exec.Command("go", "get", "-v", "-d", importPath)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err := cmd.Run()
+		if err != nil {
+			log.Fatalf("while fetching dependencies: %+v", err)
+		}
+
+		log.Printf("Entry point: %s", importPath)
+		pkgInfo := getInfo(importPath)
+		rootInfo.Imports = append(rootInfo.Imports, pkgInfo.ImportPath)
 	}
+
 	infos[rootInfo.ImportPath] = rootInfo
 
 	goroot := os.Getenv("GOROOT")
@@ -102,7 +122,7 @@ func main() {
 		if runtime.GOOS == "windows" {
 			goroot = `C:\Go`
 		} else {
-			goroot = "/usr/local"
+			goroot = "/usr/local/go"
 		}
 
 		_, err := os.Stat(goroot)
@@ -151,15 +171,7 @@ func main() {
 		done <- true
 	}()
 
-wait:
-	for {
-		select {
-		case <-done:
-			break wait
-		case <-time.After(250 * time.Millisecond):
-			fmt.Printf(".")
-		}
-	}
+	<-done
 	fmt.Printf("\n")
 
 	for _, info := range infos {
@@ -170,47 +182,59 @@ wait:
 		info.Stats.Files = int64(len(info.GoFiles) + len(info.CgoFiles))
 
 		if info.Dir != "" {
-			glb, err := exec.Command("golocc", "-o", "json", info.Dir).Output()
-			if err != nil {
-				panic(err)
-			}
+			processFile := func(f string) {
+				fpath := filepath.Join(info.Dir, f)
+				stat, err := os.Stat(fpath)
+				if err != nil {
+					log.Fatalf("while getting file size: %+v", err)
+				}
+				info.Stats.Size += stat.Size()
 
-			glo := &GoloccOutput{}
-			err = json.Unmarshal(glb, glo)
-			if err != nil {
-				panic(err)
+				cOutput, err := exec.Command("gocyclo", fpath).Output()
+				if err != nil {
+					log.Fatalf("while running gocyclo: %+v", err)
+				}
+				s := bufio.NewScanner(bytes.NewReader(cOutput))
+				for s.Scan() {
+					line := s.Text()
+					firstToken := strings.Split(line, " ")[0]
+					complex, err := strconv.ParseInt(firstToken, 10, 64)
+					if err != nil {
+						log.Fatalf("while parsing gocyclo output: %+v", err)
+					}
+					info.Stats.Complexity += complex
+				}
 			}
-
-			info.Stats.Lines = glo.NCLOC
+			for _, f := range info.GoFiles {
+				processFile(f)
+			}
+			for _, f := range info.CgoFiles {
+				processFile(f)
+			}
 		}
 	}
 
-	printed := make(map[string]bool)
-
 	yellow := color.New(color.FgYellow).SprintFunc()
+	green := color.New(color.FgGreen).SprintfFunc()
 	blue := color.New(color.FgBlue).SprintFunc()
 
 	var mktree func(info *PkgInfo) gotree.Tree
 	mktree = func(info *PkgInfo) gotree.Tree {
-		if printed[info.ImportPath] {
-			return nil
-		}
-		printed[info.ImportPath] = true
 		ip := info.ImportPath
 		ip = strings.Replace(ip, "github.com/", "@", 1)
-		tree := gotree.New(fmt.Sprintf("%s [%s]", yellow(humanize.SI(float64(info.CountLines()), "LOC")), blue(ip)))
+		tree := gotree.New(fmt.Sprintf("%s (%s) [%s]",
+			yellow(fmt.Sprintf("%d", info.CountComplexity())),
+			green(humanize.IBytes(uint64(info.CountSize()))),
+			blue(ip),
+		))
 
-		var duplicates int
-		for _, depInfo := range info.PkgDeps {
-			depTree := mktree(depInfo)
-			if depTree == nil {
-				duplicates++
-			} else {
+		if !strings.Contains(info.ImportPath, "/vendor") {
+			for _, depInfo := range info.PkgDeps {
+				depTree := mktree(depInfo)
 				tree.AddTree(depTree)
 			}
-		}
-		if duplicates > 0 {
-			tree.Add(fmt.Sprintf("+ %d duplicates", duplicates))
+		} else {
+			tree.Add("(...ignoring deps of vendored package)")
 		}
 		return tree
 	}
@@ -221,11 +245,13 @@ wait:
 	} else {
 		tree = mktree(rootInfo)
 	}
-	log.Printf(tree.Print())
+	fmt.Print(tree.Print())
 }
 
 func getInfos(importPath string) []*PkgInfo {
+	before := time.Now()
 	payload, err := exec.Command("go", "list", "-json", importPath).Output()
+	log.Printf("%s: %s", importPath, time.Since(before))
 	if err != nil {
 		log.Printf("While walking %s", importPath)
 		panic(err)
